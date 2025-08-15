@@ -1,0 +1,321 @@
+# ai_jobs_competition_model.py
+# Complete coupled system:
+#   - Competitive core (profit-gradient) for A, C, S
+#   - Labor block for xA, xH, xN and unemployment u
+#   - Baseline vs Policy schedules (policy kicks in at t_policy)
+#
+# Usage:
+#   python ai_jobs_competition_model.py
+# It will simulate both scenarios and save two figures:
+#   - fig_unemployment_policy.png
+#   - fig_job_composition_policy.png
+# Tweak parameters at the "BASELINE PARAMS" and "POLICY CHANGES" sections.
+
+import numpy as np
+import matplotlib.pyplot as plt
+from dataclasses import dataclass, asdict
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def softplus(z):  # smooth ReLU if you want to ensure positivity on some terms
+    return np.log1p(np.exp(z))
+
+# -----------------------------
+# Parameter containers
+# -----------------------------
+@dataclass
+class CoreParams:
+    # Demand & cost sensitivities (market structure)
+    lam: float = 1.0      # demand sensitivity to quality
+    mu: float  = 0.8      # demand sensitivity to cost
+
+    # Marginal quality/cost effects of tech & complements
+    alpha: float   = 0.9  # quality gain from A*S
+    beta_c: float  = 0.4  # quality gain from complements C
+    chi: float     = 0.8  # unit-cost reduction from A
+    xi: float      = 0.5  # unit-cost reduction from C
+
+    # Quadratic investment/adjustment costs (profit curvature)
+    kA: float = 0.9
+    kC: float = 0.6
+    kS: float = 0.5
+
+    # Response speeds
+    gamma_A: float = 1.2
+    gamma_C: float = 0.7
+    gamma_S: float = 0.6
+
+    # Depreciation / obsolescence
+    delta_C: float = 0.05
+    delta_S: float = 0.03
+
+    # Baseline skill stock (anchor)
+    S0: float = 1.0
+
+@dataclass
+class LaborParams:
+    # Displacement & separations
+    sigma: float = 0.9     # A-induced displacement intensity of routine tasks
+    s: float     = 0.03    # background separations across all employed
+
+    # Direct transformation (on-the-job upskilling from routine -> complementary)
+    beta_h: float = 0.22
+
+    # New-job creation channel (AI^rho * C^kappa * S^tau) with saturation
+    eta: float   = 0.35
+    rho: float   = 1.2
+    kappa: float = 0.9
+    tau: float   = 1.0
+    psi: float   = 2.0     # saturation exponent: slows creation near full employment
+
+    # Matching rates from unemployment into categories
+    mA: float = 0.02
+    mH: float = 0.06
+    mN: float = 0.05
+
+    # Hiring capacity cap (per-year fraction of labor force)
+    h_max: float = 0.10
+
+@dataclass
+class SimConfig:
+    T: float = 25.0     # years
+    dt: float = 0.01    # time step
+
+@dataclass
+class Initials:
+    A0: float  = 0.12
+    C0: float  = 0.20
+    S0: float  = 1.05    # start slightly above baseline know-how
+
+    xA0: float = 0.60    # routine share
+    xH0: float = 0.35    # complementary share
+    xN0: float = 0.05    # new-task share
+
+# -----------------------------
+# Schedules (time-varying params)
+# -----------------------------
+def baseline_schedule(t, core: CoreParams, labor: LaborParams):
+    """Return (core, labor) possibly time-modified. For baseline, return as-is."""
+    return core, labor
+
+def policy_schedule(t, core: CoreParams, labor: LaborParams, t_policy=5.0):
+    """
+    After t_policy, accelerate skills & complements (gamma_S, gamma_C),
+    boost matching & creation (mH, mN, eta), ease saturation (psi),
+    and slightly soften displacement (sigma).
+    """
+    c = CoreParams(**asdict(core))
+    L = LaborParams(**asdict(labor))
+    if t >= t_policy:
+        c.gamma_S *= 1.8
+        c.gamma_C *= 1.3
+        L.mH *= 1.8
+        L.mN *= 1.8
+        L.eta *= 1.5
+        L.psi = max(1.6, L.psi * 0.8)
+        L.h_max *= 1.6
+        L.sigma *= 0.7
+    return c, L
+
+# -----------------------------
+# Competitive core RHS (profit-gradient)
+# -----------------------------
+def core_rhs(A, C, S, p: CoreParams):
+    """
+    Profit-gradient logic:
+      dA = gamma_A * A(1-A) * [lam*alpha*S + mu*chi - 2kA*A]
+      dC = gamma_C * [lam*beta_c + mu*xi - 2kC*C] - delta_C*C
+      dS = gamma_S * [lam*alpha*A - 2kS(S-S0)] - delta_S(S-S0)
+    """
+    gradA = (p.lam * p.alpha * S + p.mu * p.chi) - 2.0 * p.kA * A
+    dA = p.gamma_A * A * (1 - A) * gradA
+
+    gradC = (p.lam * p.beta_c + p.mu * p.xi) - 2.0 * p.kC * C
+    dC = p.gamma_C * gradC - p.delta_C * C
+
+    gradS = (p.lam * p.alpha * A) - 2.0 * p.kS * (S - p.S0)
+    dS = p.gamma_S * gradS - p.delta_S * (S - p.S0)
+
+    return dA, dC, dS
+
+# -----------------------------
+# Labor block RHS
+# -----------------------------
+def labor_rhs(xA, xH, xN, A, C, S, p: LaborParams):
+    """
+    Flows:
+      dxA = -sigma*A*xA - s*xA + mA*u
+      dxH =  beta_h*A*xA - s*xH + mH*u
+      dxN =  creation*(1-xN) - s*xN + mN*u
+    where u = 1 - (xA + xH + xN) and
+      creation = eta * A^rho * C^kappa * S^tau * (1 - (xH+xN))^psi
+    hiring capacity H <= h_max enforced by scaling hires proportionally.
+    """
+    u = max(0.0, 1.0 - (xA + xH + xN))
+
+    # Creation intensity with saturation near full employment
+    employed_share = clamp(xH + xN, 0.0, 1.0)
+    sat = (1.0 - employed_share)
+    sat = sat ** p.psi
+    creation = p.eta * (A ** p.rho) * (C ** p.kappa) * (S ** p.tau) * sat
+    creation = max(0.0, creation)
+
+    # Intended hires/matches
+    hire_A = p.mA * u
+    hire_H = p.mH * u + p.beta_h * A * xA  # include direct on-the-job retooling
+    hire_N = p.mN * u + creation
+
+    total_hires_intent = hire_A + hire_H + hire_N
+    if total_hires_intent > p.h_max:
+        scale = p.h_max / total_hires_intent
+        hire_A *= scale; hire_H *= scale; hire_N *= scale
+
+    # ODEs
+    dxA = -p.sigma * A * xA - p.s * xA + hire_A
+    dxH = hire_H - p.s * xH
+    dxN = hire_N - p.s * xN
+
+    return dxA, dxH, dxN
+
+# -----------------------------
+# Integrator (RK4 for stability)
+# -----------------------------
+def simulate(core: CoreParams, labor: LaborParams, initials: Initials,
+             cfg: SimConfig, schedule_fn=None):
+    T, dt = cfg.T, cfg.dt
+    N = int(T / dt) + 1
+    t = np.linspace(0.0, T, N)
+
+    A = np.zeros(N); C = np.zeros(N); S = np.zeros(N)
+    xA = np.zeros(N); xH = np.zeros(N); xN = np.zeros(N); U = np.zeros(N)
+
+    A[0]  = clamp(initials.A0, 0.0, 1.0)
+    C[0]  = max(0.0, initials.C0)
+    S[0]  = max(0.0, initials.S0)
+    xA[0] = clamp(initials.xA0, 0.0, 1.0)
+    xH[0] = clamp(initials.xH0, 0.0, 1.0)
+    xN[0] = clamp(initials.xN0, 0.0, 1.0)
+    # Keep shares ≤ 1
+    total_emp0 = xA[0] + xH[0] + xN[0]
+    if total_emp0 > 1.0:
+        xA[0] /= total_emp0; xH[0] /= total_emp0; xN[0] /= total_emp0
+    U[0] = max(0.0, 1.0 - (xA[0] + xH[0] + xN[0]))
+
+    for k in range(N-1):
+        # Apply schedule (time-varying parameters)
+        if schedule_fn is None:
+            core_k, labor_k = core, labor
+        else:
+            core_k, labor_k = schedule_fn(t[k], core, labor)
+
+        # RK4 for core
+        def core_step(Ak, Ck, Sk):
+            d1 = core_rhs(Ak, Ck, Sk, core_k)
+            d2 = core_rhs(Ak + 0.5*dt*d1[0], Ck + 0.5*dt*d1[1], Sk + 0.5*dt*d1[2], core_k)
+            d3 = core_rhs(Ak + 0.5*dt*d2[0], Ck + 0.5*dt*d2[1], Sk + 0.5*dt*d2[2], core_k)
+            d4 = core_rhs(Ak + dt*d3[0],     Ck + dt*d3[1],     Sk + dt*d3[2],     core_k)
+            dA = (d1[0] + 2*d2[0] + 2*d3[0] + d4[0]) / 6.0
+            dC = (d1[1] + 2*d2[1] + 2*d3[1] + d4[1]) / 6.0
+            dS = (d1[2] + 2*d2[2] + 2*d3[2] + d4[2]) / 6.0
+            return dA, dC, dS
+
+        # RK4 for labor
+        def labor_step(xAk, xHk, xNk, Ak, Ck, Sk):
+            e1 = labor_rhs(xAk, xHk, xNk, Ak, Ck, Sk, labor_k)
+            e2 = labor_rhs(xAk + 0.5*dt*e1[0], xHk + 0.5*dt*e1[1], xNk + 0.5*dt*e1[2],
+                           Ak, Ck, Sk, labor_k)
+            e3 = labor_rhs(xAk + 0.5*dt*e2[0], xHk + 0.5*dt*e2[1], xNk + 0.5*dt*e2[2],
+                           Ak, Ck, Sk, labor_k)
+            e4 = labor_rhs(xAk + dt*e3[0], xHk + dt*e3[1], xNk + dt*e3[2],
+                           Ak, Ck, Sk, labor_k)
+            dxA = (e1[0] + 2*e2[0] + 2*e3[0] + e4[0]) / 6.0
+            dxH = (e1[1] + 2*e2[1] + 2*e3[1] + e4[1]) / 6.0
+            dxN = (e1[2] + 2*e2[2] + 2*e3[2] + e4[2]) / 6.0
+            return dxA, dxH, dxN
+
+        dA, dC, dS = core_step(A[k], C[k], S[k])
+        # Update core (clamping)
+        A_k1 = clamp(A[k] + dt*dA, 0.0, 1.0)
+        C_k1 = max(0.0, C[k] + dt*dC)
+        S_k1 = max(0.0, S[k] + dt*dS)
+
+        dxA, dxH, dxN = labor_step(xA[k], xH[k], xN[k], A[k], C[k], S[k])
+        xA_k1 = max(0.0, xA[k] + dt*dxA)
+        xH_k1 = max(0.0, xH[k] + dt*dxH)
+        xN_k1 = max(0.0, xN[k] + dt*dxN)
+
+        # Keep total employment within [0,1] by proportional scaling if needed
+        emp_sum = xA_k1 + xH_k1 + xN_k1
+        if emp_sum > 1.0:
+            xA_k1 /= emp_sum; xH_k1 /= emp_sum; xN_k1 /= emp_sum
+
+        # Commit
+        A[k+1], C[k+1], S[k+1] = A_k1, C_k1, S_k1
+        xA[k+1], xH[k+1], xN[k+1] = xA_k1, xH_k1, xN_k1
+        U[k+1] = max(0.0, 1.0 - (xA[k+1] + xH[k+1] + xN[k+1]))
+
+    return {
+        "t": t, "A": A, "C": C, "S": S,
+        "xA": xA, "xH": xH, "xN": xN, "u": U
+    }
+
+# -----------------------------
+# Plot helpers (LinkedIn-ready)
+# -----------------------------
+def plot_unemployment_compare(baseline, policy, fname="fig_unemployment_policy.png"):
+    plt.figure(figsize=(10,5))
+    plt.plot(baseline["t"], baseline["u"], label="Unemployment — Baseline")
+    plt.plot(policy["t"],   policy["u"],   label="Unemployment — Policy", linestyle="--")
+    plt.xlabel("Time (years)")
+    plt.ylabel("Share of labor force")
+    plt.title("AI Adoption Shock: Skills/Complement Policy Reduces Unemployment Bulge")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(fname, dpi=300)
+    plt.close()
+
+def plot_job_composition(run, fname="fig_job_composition_policy.png"):
+    t = run["t"]
+    xA, xH, xN, u = run["xA"], run["xH"], run["xN"], run["u"]
+    plt.figure(figsize=(10,5))
+    plt.stackplot(t, xA, xH, xN, labels=["Routine", "AI-Complementary", "New AI-Enabled"])
+    plt.plot(t, u, linewidth=2.0, label="Unemployment (line)")
+    plt.xlabel("Time (years)")
+    plt.ylabel("Share of labor force")
+    plt.title("Employment Composition Over Time (Policy Scenario)")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(fname, dpi=300)
+    plt.close()
+
+# -----------------------------
+# Main (runs both scenarios)
+# -----------------------------
+if __name__ == "__main__":
+    core = CoreParams()
+    labor = LaborParams()
+    cfg = SimConfig()
+    ic  = Initials()
+
+    # Baseline (no time-varying policy)
+    base = simulate(core, labor, ic, cfg, schedule_fn=baseline_schedule)
+
+    # Policy (triggered improvements after t_policy)
+    pol  = simulate(core, labor, ic, cfg, schedule_fn=lambda tt, c, L: policy_schedule(tt, c, L, t_policy=5.0))
+
+    # Save figures for LinkedIn
+    plot_unemployment_compare(base, pol, fname="fig_unemployment_policy.png")
+    plot_job_composition(pol, fname="fig_job_composition_policy.png")
+
+    # Optional: also save the technology race plot (A, C, S) if desired:
+    plt.figure(figsize=(10,5))
+    plt.plot(pol["t"], pol["A"], label="A (Adoption)")
+    plt.plot(pol["t"], pol["C"], label="C (Complements)")
+    plt.plot(pol["t"], pol["S"], label="S (Skills)")
+    plt.xlabel("Time (years)"); plt.ylabel("Level")
+    plt.title("Competitive ROI Race: Adoption → Complements → Skills (Policy)")
+    plt.legend(); plt.tight_layout(); plt.savefig("fig_core_race.png", dpi=300); plt.close()
